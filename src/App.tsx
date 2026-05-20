@@ -6,6 +6,7 @@ import { Download, FileInput, FileText, Upload } from 'lucide-react'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfjsWorkerSrc from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import * as XLSX from 'xlsx'
+import { inferBillFields, reconstructPdfTextItems, shouldUseOcrFallback } from './lib/billExtract'
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerSrc
 
@@ -189,184 +190,23 @@ function doInnerHtml(order: Order, profile: Profile) {
   `
 }
 
-/** 收货人块结束：标准分区 + 货描/运费等（PDF 阅读顺序常把货描接在地址后且尚无 NOTIFY） */
-function consigneeBlockEndIndex(tail: string): number {
-  const stopAt = (re: RegExp) => {
-    const i = tail.search(re)
-    return i >= 0 ? i : tail.length
-  }
-  return Math.min(
-    stopAt(/\bNOTIFY\s+PARTY\b/i),
-    stopAt(/\bALSO\s+NOTIFY\b/i),
-    stopAt(/\bFORWARDING\s+AGENT\b/i),
-    stopAt(/\bPLACE\s+OF\s+RECEIPT\b/i),
-    stopAt(/\bPRE[-\s]?CARRIAGE\b/i),
-    stopAt(/\bEXPORT\s+REFERENCES\b/i),
-    stopAt(/\bMARKS\s+AND\s+NUMBERS\b/i),
-    stopAt(/\bSHIPPER'?S\s+(?:LOAD|COUNT|WEIGHT|STOWAGE)\b/i),
-    stopAt(/\b\d{1,6}\s+PACKAGES\b/i),
-    stopAt(/\b\d{1,3}\s*[Xx]\s*\d{1,2}'?\s*(?:HQ|HC|GP|RF|OT)\b/i),
-    stopAt(/\bS\.?\s*T\.?\s*C\.?\b/i),
-    stopAt(/\bSAID\s+TO\s+CONTAIN\b/i),
-    stopAt(/\bFREIGHT\s+(?:PREPAID|COLLECT|PAYABLE)\b/i),
-    stopAt(/\bSHIPPED\s+ON\s+BOARD\b/i),
-    stopAt(/\bSAY\s+TOTAL\b/i),
-    stopAt(/\bNO\s+WOOD\s+PACKING\b/i),
-    stopAt(/\bPARTICULARS\s+FURNISHED\b/i),
-    stopAt(/\bDESCRIPTION\s+OF\s+GOODS\b/i),
-    stopAt(/\bTOTAL\s+NUMBER\s+OF\s+CONTAINERS\b/i),
-  )
-}
-
-/** 从「CONSIGNEE」起跳到真实内容起点；跳过 SAME AS CONSIGNEE、CONSIGNEE'S */
-function consigneeContentStartIndex(raw: string): number {
-  /** 非 g：避免全局 lastIndex；只取第一处「栏目标题」行 */
-  const section = raw.match(/(?:^|[\n\r\u2028\u2029])\s*CONSIGNEE(?:\s*\([^)]{0,400}\))?\s*:?\s*/im)
-  if (section?.index != null) return section.index + section[0].length
-
-  const lower = raw.toLowerCase()
-  let pos = 0
-  while (pos < raw.length) {
-    const i = lower.indexOf('consignee', pos)
-    if (i < 0) return -1
-    const prev = raw.slice(Math.max(0, i - 8), i)
-    if (/\bAS\s+$/i.test(prev)) {
-      pos = i + 9
-      continue
-    }
-    if (/^CONSIGNEE'S\b/i.test(raw.slice(i, i + 12))) {
-      pos = i + 12
-      continue
-    }
-    const rest = raw.slice(i)
-    const hdr = rest.match(/^CONSIGNEE\s*(?:\([^)]{0,400}\))?\s*:?\s*/i)
-    return i + (hdr?.[0]?.length ?? 9)
-  }
-  return -1
-}
-
-const CONSIGNEE_HARD_CAP = 900
-
-/** 单行/压扁文本中的 CONSIGNEE（pdf.js 常把整页拼成少换行，行首 CONSIGNEE 正则会失效） */
-function extractConsigneeFlat(compact: string): string {
-  const lower = compact.toLowerCase()
-  let pos = 0
-  while (pos < compact.length) {
-    const i = lower.indexOf('consignee', pos)
-    if (i < 0) return ''
-    const near = compact.slice(Math.max(0, i - 3), Math.min(compact.length, i + 14))
-    if (/\bAS\s+CONSIGNEE\b/i.test(near)) {
-      pos = i + 9
-      continue
-    }
-    if (/^CONSIGNEE'S\b/i.test(compact.slice(i, i + 12))) {
-      pos = i + 12
-      continue
-    }
-    const rest = compact.slice(i)
-    const hdr = rest.match(/^CONSIGNEE\s*(?:\([^)]{0,400}\))?\s*:?\s*/i)
-    const start = i + (hdr?.[0]?.length ?? 9)
-    const tail = compact.slice(start)
-    let end = consigneeBlockEndIndex(tail)
-    if (end > CONSIGNEE_HARD_CAP) end = CONSIGNEE_HARD_CAP
-    let block = tail.slice(0, end).trim()
-    if (block.length >= CONSIGNEE_HARD_CAP) block = block.slice(0, CONSIGNEE_HARD_CAP)
-    const tidied = tidyConsigneeBlock(block.replace(/\s{2,}/g, '\n'))
-    if (tidied.length > 0) return tidied
-    pos = i + 9
-  }
-  return ''
-}
-
-/** 从提单正文中截取收货人块（保留换行）；兼容 CONSIGNEE (Name and Address) 及 PDF 乱序空格 */
-function extractConsigneeFromBillText(text: string): string {
-  const raw = text.replace(/\r\n/g, '\n')
-  const compact = raw.replace(/\s+/g, ' ')
-  const start = consigneeContentStartIndex(raw)
-  if (start < 0) {
-    const cjk = raw.search(/(?:收货人|收货单位)\s*[:：]?\s*/i)
-    if (cjk >= 0) {
-      const tail = raw.slice(cjk).replace(/^(?:收货人|收货单位)\s*[:：]?\s*/i, '')
-      const stop = tail.search(/\n\s*(?:通知方|NOTIFY)/i)
-      const t = tidyConsigneeBlock(stop >= 0 ? tail.slice(0, stop) : tail)
-      if (t) return t
-    }
-    return extractConsigneeFlat(compact)
-  }
-
-  let tail = raw.slice(start)
-  let end = consigneeBlockEndIndex(tail)
-  if (end > CONSIGNEE_HARD_CAP) end = CONSIGNEE_HARD_CAP
-  let block = tail.slice(0, end)
-  if (block.length >= CONSIGNEE_HARD_CAP) {
-    const cut = block.lastIndexOf('\n', CONSIGNEE_HARD_CAP)
-    if (cut > 120) block = block.slice(0, cut)
-  }
-  const tidied = tidyConsigneeBlock(block)
-  if (tidied.length > 0) return tidied
-  return extractConsigneeFlat(compact)
-}
-
-function tidyConsigneeBlock(block: string): string {
-  const junkLine = (l: string) =>
-    /^(?:NOTIFY|ALSO\s+NOTIFY|M\/B|MARKS)\b/i.test(l) ||
-    /^\d+\s+PACKAGES\b/i.test(l) ||
-    /\bSHIPPER'?S\s+LOAD\b/i.test(l) ||
-    /^\d+\s*X\s*\d{1,2}'?\s*(?:HQ|HC|GP|RF)\b/i.test(l) ||
-    /^S\.?\s*T\.?\s*C\.?\b/i.test(l) ||
-    /^FREIGHT\s+(?:PREPAID|COLLECT|PAYABLE)\b/i.test(l) ||
-    /^SHIPPED\s+ON\s+BOARD\b/i.test(l) ||
-    /^SAY\s+TOTAL\b/i.test(l) ||
-    /^NO\s+WOOD\s+PACKING\b/i.test(l)
-  return block
-    .split(/\n+/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0 && !junkLine(l))
-    .slice(0, 14)
-    .join('\n')
-    .replace(/[ \t]{2,}/g, ' ')
-    .trim()
-}
-
 function inferOrderFromText(text: string, profile: Profile): Order {
-  const compact = text.replace(/\s+/g, ' ')
-  const containerNo = compact.match(/\b[A-Z]{4}\d{7}\b/)?.[0] ?? ''
-  const billOfLadingNo =
-    compact.match(/\b(?:ONEY|MAEU|EGLV|COSU|CMDU|HLCU|OOLU|MEDU|MSCU)[A-Z0-9]{8,15}\b/)?.[0] ??
-    compact.match(/(?:B\/L|BL|BILL OF LADING|MBL)\s*(?:NO\.?|NUMBER)?\s*[:#-]?\s*([A-Z0-9 -]{8,24})/i)?.[1]?.trim() ??
-    ''
-  const packages =
-    compact.match(/\b(\d{1,6})\s*(?:CARTONS|CTNS|PACKAGES|PKGS)\b/i)?.[1] ??
-    compact.match(/\b(\d{1,6})(?:CARTONS|CTNS|PACKAGES|PKGS)\b/i)?.[1] ??
-    ''
-  const weight =
-    compact.match(/\b(\d{1,7}(?:,\d{3})*(?:\.\d+)?)\s*(KGS|KG|LBS|LB)\b/i)?.slice(1).join('').toUpperCase() ??
-    ''
-  const containerType = compact.match(/\b(20GP|40GP|40HQ|40HC|45HQ|20'GP|40'HQ|40'HC)\b/i)?.[1] ?? ''
-  const loading = compact.match(/PORT OF LOADING\s+([A-Z ,.-]+?)\s+PORT OF DISCHARGE/i)?.[1]?.trim()
-  const discharge = compact.match(/PORT OF DISCHARGE\s+([A-Z ,.-]+?)\s+(?:PLACE OF DELIVERY|PARTICULARS|CONTAINER)/i)?.[1]?.trim()
-  const vessel = compact.match(/(?:OCEAN VESSEL|VESSEL)\s+([A-Z0-9 -]+?)\s+(?:VOYAGE|VOY)\s*([A-Z0-9-]+)/i)
-  const consignee =
-    extractConsigneeFromBillText(text) ||
-    compact
-      .match(/CONSIGNEE\s*(?:\([^)]*\))?\s+(.+?)\s+(?:NOTIFY\s+PARTY|ALSO\s+NOTIFY|PRE[-\s]?CARRIAGE|PLACE\s+OF\s+RECEIPT)/i)?.[1]
-      ?.trim() ||
-    ''
+  const fields = inferBillFields(text)
 
   return {
     ...sampleOrder,
     id: crypto.randomUUID(),
-    importer: consignee ? consignee.replace(/\s{2,}/g, '\n') : sampleOrder.importer,
-    refNo: billOfLadingNo || containerNo || String(Date.now()).slice(-7),
-    carrier: vessel ? `${vessel[1].trim()} ${vessel[2].trim()}` : '',
+    importer: fields.importer || sampleOrder.importer,
+    refNo: fields.refNo || String(Date.now()).slice(-7),
+    carrier: fields.carrier,
     location: profile.defaultLocation,
-    originDestination: loading && discharge ? `${loading}/${discharge}` : '',
-    billOfLadingNo,
+    originDestination: fields.originDestination,
+    billOfLadingNo: fields.billOfLadingNo,
     arrivalDate: '',
-    packages,
-    containerNo,
-    containerType,
-    weight,
+    packages: fields.packages,
+    containerNo: fields.containerNo,
+    containerType: fields.containerType,
+    weight: fields.weight,
     description: profile.defaultDescription,
     route: profile.defaultRoute,
     deliveryTo: '',
@@ -381,6 +221,45 @@ function newOrderFromSample(): Order {
   return { ...sampleOrder, id: crypto.randomUUID() }
 }
 
+async function renderPdfPageToCanvas(page: pdfjsLib.PDFPageProxy, scale = 2) {
+  const viewport = page.getViewport({ scale })
+  const canvas = document.createElement('canvas')
+  const context = canvas.getContext('2d')
+  if (!context) throw new Error('无法创建 OCR 画布')
+  canvas.width = Math.ceil(viewport.width)
+  canvas.height = Math.ceil(viewport.height)
+  await page.render({ canvasContext: context, viewport } as Parameters<typeof page.render>[0]).promise
+  return canvas
+}
+
+async function extractPdfTextByOcr(
+  document: pdfjsLib.PDFDocumentProxy,
+  onProgress: (message: string) => void,
+): Promise<string> {
+  const { createWorker } = await import('tesseract.js')
+  const worker = await createWorker('eng', undefined, {
+    logger: (message) => {
+      if (message.status === 'recognizing text') {
+        onProgress(`正在 OCR 识别扫描件… ${Math.round(message.progress * 100)}%`)
+      }
+    },
+  })
+
+  try {
+    const texts: string[] = []
+    for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+      onProgress(`正在渲染第 ${pageNumber}/${document.numPages} 页用于 OCR…`)
+      const page = await document.getPage(pageNumber)
+      const canvas = await renderPdfPageToCanvas(page)
+      const result = await worker.recognize(canvas)
+      texts.push(result.data.text)
+    }
+    return texts.join('\n')
+  } finally {
+    await worker.terminate()
+  }
+}
+
 export default function App() {
   const profile = defaultProfile
   const [order, setOrder] = useState<Order>(newOrderFromSample)
@@ -390,6 +269,7 @@ export default function App() {
   const [pasteText, setPasteText] = useState('')
   const [billText, setBillText] = useState('')
   const [pdfExtractHint, setPdfExtractHint] = useState('')
+  const [isExtractingBill, setIsExtractingBill] = useState(false)
   const [previewScale, setPreviewScale] = useState(1)
   const [previewContentH, setPreviewContentH] = useState(1056)
   const previewRef = useRef<HTMLDivElement>(null)
@@ -486,6 +366,7 @@ export default function App() {
     const input = event.target
     const file = input.files?.[0]
     if (!file) return
+    setIsExtractingBill(true)
     setPdfExtractHint('正在读取 PDF…')
     try {
       const document = await pdfjsLib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise
@@ -493,21 +374,37 @@ export default function App() {
       for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
         const page = await document.getPage(pageNumber)
         const content = await page.getTextContent()
-        pageTexts.push(content.items.map((item) => ('str' in item ? String(item.str) : '')).join(' '))
+        const textItems = content.items
+          .filter((item) => 'str' in item)
+          .map((item) => ({
+            str: String(item.str),
+            transform: 'transform' in item ? item.transform : undefined,
+          }))
+        pageTexts.push(reconstructPdfTextItems(textItems))
       }
-      const extractedText = pageTexts.join('\n')
+      let extractedText = pageTexts.join('\n')
+      let usedOcr = false
+      if (shouldUseOcrFallback(extractedText)) {
+        setPdfExtractHint('PDF 文字层太少，正在尝试扫描件 OCR…')
+        const ocrText = await extractPdfTextByOcr(document, setPdfExtractHint)
+        if (ocrText.trim()) {
+          extractedText = ocrText
+          usedOcr = true
+        }
+      }
       setBillText(extractedText)
       if (!extractedText.trim()) {
-        setPdfExtractHint('未识别到文字层（多为扫描件）。请手动粘贴提单文字或先 OCR。')
+        setPdfExtractHint('未识别到可用文字。请确认 PDF 清晰，或先用专业 OCR 后再上传。')
       } else {
         const inferred = inferOrderFromText(extractedText, profile)
         setOrder((prev) => ({ ...inferred, id: prev.id }))
-        setPdfExtractHint(`已提取 ${document.numPages} 页文字，并已填入中间表单。`)
+        setPdfExtractHint(`已${usedOcr ? '通过 OCR ' : ''}提取 ${document.numPages} 页文字，并已填入中间表单。`)
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       setPdfExtractHint(`PDF 读取失败：${message}`)
     } finally {
+      setIsExtractingBill(false)
       input.value = ''
     }
   }
@@ -563,9 +460,9 @@ export default function App() {
           <div className="panel-card">
             <h2><FileText size={16} /> 提单 / PDF 提取</h2>
             <label className="upload-box">
-              <input accept="application/pdf" type="file" onChange={handleBillPdf} />
+              <input accept="application/pdf" type="file" onChange={handleBillPdf} disabled={isExtractingBill} />
               <FileText size={18} />
-              <span>上传 HBL / MBL PDF</span>
+              <span>{isExtractingBill ? '正在识别 PDF…' : '上传 HBL / MBL PDF'}</span>
             </label>
             <textarea
               className="bill-text-textarea"
@@ -576,7 +473,7 @@ export default function App() {
               }}
               placeholder="粘贴提单文字后点「从提单文本生成」。扫描件需 OCR；柜号查 MBL/ETA 可再接船司 API。"
             />
-            <button className="primary full" type="button" onClick={addFromBillText} disabled={!billText.trim()}>
+            <button className="primary full" type="button" onClick={addFromBillText} disabled={!billText.trim() || isExtractingBill}>
               从提单文本生成
             </button>
             {pdfExtractHint ? <p className="pdf-extract-hint">{pdfExtractHint}</p> : null}
