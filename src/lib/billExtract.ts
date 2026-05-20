@@ -11,10 +11,12 @@ export type BillFields = {
   carrier: string
   originDestination: string
   billOfLadingNo: string
+  arrivalDate: string
   packages: string
   containerNo: string
   containerType: string
   weight: string
+  description: string
 }
 
 type TextLine = {
@@ -206,6 +208,78 @@ function tidyConsigneeBlock(block: string): string {
     .trim()
 }
 
+function normalizeDate(value: string): string {
+  return value.trim().replace(/[.\-]/g, '/')
+}
+
+function extractArrivalDate(text: string): string {
+  const compact = text.replace(/\s+/g, ' ')
+  const date = String.raw`(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}[./-]\d{1,2}[./-]\d{1,2}|[A-Z]{3,9}\s+\d{1,2},?\s+\d{4})`
+  const freeTimePatterns = [
+    new RegExp(String.raw`\b(?:FREE\s*TIME\s*(?:EXP\.?|EXPIRE[SD]?|EXPIRATION)?|LAST\s+FREE\s+DAY|LFD)\s*[:#-]?\s*${date}`, 'i'),
+    new RegExp(String.raw`\b${date}\s*(?:FREE\s*TIME|LAST\s+FREE\s+DAY|LFD)\b`, 'i'),
+  ]
+  for (const pattern of freeTimePatterns) {
+    const match = compact.match(pattern)
+    if (match?.[1]) return normalizeDate(match[1])
+  }
+
+  const etaPatterns = [
+    new RegExp(String.raw`\b(?:ETA|E\.T\.A\.|ARRIVAL|DATE\s+OF\s+ARRIVAL|VESSEL\s+ARRIVAL)\s*[:#-]?\s*${date}`, 'i'),
+    new RegExp(String.raw`\b${date}\s*(?:ETA|ARRIVAL)\b`, 'i'),
+  ]
+  for (const pattern of etaPatterns) {
+    const match = compact.match(pattern)
+    if (match?.[1]) return normalizeDate(match[1])
+  }
+  return ''
+}
+
+function tidyDescription(value: string): string {
+  return value
+    .replace(/\b(?:CY\s*CY|CFS\s*CFS|FCL|LCL)\b/gi, ' ')
+    .replace(/\b\d{1,6}\s*(?:PACKAGES|PKGS|CARTONS|CTNS|PCS|PIECES)\b/gi, ' ')
+    .replace(/\b\d{1,3}\s*[Xx]\s*\d{1,2}'?\s*(?:HQ|HC|GP|RF|OT)\b/gi, ' ')
+    .replace(/\b(?:F\.?C\.?L\.?|L\.?C\.?L\.?)\b/gi, ' ')
+    .replace(/\bS\.?\s*T\.?\s*C\.?\b/gi, ' ')
+    .replace(/\bSAID\s+TO\s+CONTAIN\b/gi, ' ')
+    .replace(/\bSHIPPER'?S\s+(?:LOAD|COUNT|WEIGHT|STOWAGE)(?:\s*&\s*COUNT)?\b/gi, ' ')
+    .replace(/\b(?:SHIPPED\s+ON|BOARD|TOTAL|CONTAINERS?|ONLY)\b.*$/i, '')
+    .replace(/\b(?:FREIGHT\s+(?:PREPAID|COLLECT|PAYABLE)|NO\s+WOOD\s+PACKING|PACKING\s+MATERIAL|MARKS\s+AND\s+NUMBERS)\b.*$/i, '')
+    .replace(/[^A-Z0-9 &'(),./-]+/gi, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+function extractDescription(text: string): string {
+  const raw = text.replace(/\r\n/g, '\n')
+  const compact = raw.replace(/\s+/g, ' ')
+  const label = raw.match(
+    /(?:DESCRIPTION\s+OF\s+GOODS|DESCRIPTION\s+OF\s+ARTICLES|COMMODITY|GOODS\s+DESCRIPTION)\s*:?\s*([\s\S]{1,500})/i,
+  )
+  if (label?.[1]) {
+    const end = label[1].search(
+      /\b(?:NO\s+WOOD\s+PACKING|MARKS\s+AND\s+NUMBERS|FREIGHT\s+(?:PREPAID|COLLECT|PAYABLE)|TOTAL\s+NUMBER|CONTAINER\s+NO\.?|GROSS\s+WEIGHT)\b/i,
+    )
+    const block = end >= 0 ? label[1].slice(0, end) : label[1]
+    const firstUsefulLine = block
+      .split(/\n+/)
+      .map(tidyDescription)
+      .find((line) => line.length > 1)
+    if (firstUsefulLine) return firstUsefulLine
+  }
+
+  const stc = compact.match(
+    /\b(?:S\.?\s*T\.?\s*C\.?|SAID\s+TO\s+CONTAIN)\s+(.{2,220}?)(?:\bSHIPPED\s+ON\b|\bFREIGHT\s+(?:PREPAID|COLLECT|PAYABLE)\b|\bTOTAL\b|\bNO\s+WOOD\s+PACKING\b|$)/i,
+  )?.[1]
+  if (stc) {
+    const description = tidyDescription(stc)
+    if (description) return description
+  }
+
+  return ''
+}
+
 export function inferBillFields(text: string): BillFields {
   const compact = text.replace(/\s+/g, ' ')
   const containerNo = compact.match(/\b[A-Z]{4}\d{7}\b/)?.[0] ?? ''
@@ -224,6 +298,8 @@ export function inferBillFields(text: string): BillFields {
   const loading = compact.match(/PORT OF LOADING\s+([A-Z ,.-]+?)\s+PORT OF DISCHARGE/i)?.[1]?.trim()
   const discharge = compact.match(/PORT OF DISCHARGE\s+([A-Z ,.-]+?)\s+(?:PLACE OF DELIVERY|PARTICULARS|CONTAINER)/i)?.[1]?.trim()
   const vessel = compact.match(/(?:OCEAN VESSEL|VESSEL)\s+([A-Z0-9 -]+?)\s+(?:VOYAGE|VOY)\s*([A-Z0-9-]+)/i)
+  const arrivalDate = extractArrivalDate(text)
+  const description = extractDescription(text)
   const importer =
     extractConsigneeFromBillText(text) ||
     compact
@@ -237,9 +313,11 @@ export function inferBillFields(text: string): BillFields {
     carrier: vessel ? `${vessel[1].trim()} ${vessel[2].trim()}` : '',
     originDestination: loading && discharge ? `${loading}/${discharge}` : '',
     billOfLadingNo,
+    arrivalDate,
     packages,
     containerNo,
     containerType,
     weight,
+    description,
   }
 }

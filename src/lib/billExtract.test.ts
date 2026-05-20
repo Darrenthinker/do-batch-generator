@@ -73,6 +73,45 @@ describe('inferBillFields', () => {
     expect(fields.containerType).toBe("40'HQ")
     expect(fields.weight).toBe('3048.00KGS')
   })
+
+  it('prefers last free day over ETA when both are present', () => {
+    const fields = inferBillFields(
+      [
+        'CONSIGNEE',
+        'ARCOSENTINOR GROUP CORP',
+        'NOTIFY PARTY SAME AS CONSIGNEE',
+        'ETA 08/28/25',
+        'FREE TIME EXP. 09/04/25',
+      ].join('\n'),
+    )
+
+    expect(fields.arrivalDate).toBe('09/04/25')
+  })
+
+  it('extracts the core commodity from STC cargo wording', () => {
+    const fields = inferBillFields(
+      [
+        '91 PACKAGES',
+        "2X40'HQ (F.C.L.) S.T.C CYCY SOFA SETS SHIPPED ON",
+        'BOARD 9338KGS JAN 23,2026 TOTAL:TWO CONTAINERS ONLY.',
+        'FREIGHT PREPAID',
+      ].join('\n'),
+    )
+
+    expect(fields.description).toBe('SOFA SETS')
+  })
+
+  it('extracts goods after description labels and stops before packing notes', () => {
+    const fields = inferBillFields(
+      [
+        'DESCRIPTION OF GOODS',
+        'TENSION ROPE',
+        'NO WOOD PACKING MATERIAL IS USED IN SHIPMENT',
+      ].join('\n'),
+    )
+
+    expect(fields.description).toBe('TENSION ROPE')
+  })
 })
 
 describe('shouldUseOcrFallback', () => {
